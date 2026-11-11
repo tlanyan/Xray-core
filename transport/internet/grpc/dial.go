@@ -2,30 +2,34 @@ package grpc
 
 import (
 	"context"
-	gonet "net"
+	"reflect"
 	"sync"
 	"time"
 
 	"github.com/xtls/xray-core/common"
+	c "github.com/xtls/xray-core/common/ctx"
+	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/session"
+	"github.com/xtls/xray-core/common/utils"
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/grpc/encoding"
+	"github.com/xtls/xray-core/transport/internet/reality"
 	"github.com/xtls/xray-core/transport/internet/stat"
 	"github.com/xtls/xray-core/transport/internet/tls"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/backoff"
 	"google.golang.org/grpc/connectivity"
-	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
 )
 
 func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (stat.Connection, error) {
-	newError("creating connection to ", dest).WriteToLog(session.ExportIDToError(ctx))
+	errors.LogInfo(ctx, "creating connection to ", dest)
 
 	conn, err := dialgRPC(ctx, dest, streamSettings)
 	if err != nil {
-		return nil, newError("failed to dial gRPC").Base(err)
+		return nil, errors.New("failed to dial gRPC").Base(err)
 	}
 	return stat.Connection(conn), nil
 }
@@ -49,24 +53,25 @@ func dialgRPC(ctx context.Context, dest net.Destination, streamSettings *interne
 
 	conn, err := getGrpcClient(ctx, dest, streamSettings)
 	if err != nil {
-		return nil, newError("Cannot dial gRPC").Base(err)
+		return nil, errors.New("Cannot dial gRPC").Base(err)
 	}
 	client := encoding.NewGRPCServiceClient(conn)
 	if grpcSettings.MultiMode {
-		newError("using gRPC multi mode").AtDebug().WriteToLog()
-		grpcService, err := client.(encoding.GRPCServiceClientX).TunMultiCustomName(ctx, grpcSettings.getNormalizedName())
+		errors.LogDebug(ctx, "using gRPC multi mode service name: `"+grpcSettings.getServiceName()+"` stream name: `"+grpcSettings.getTunMultiStreamName()+"`")
+		grpcService, err := client.(encoding.GRPCServiceClientX).TunMultiCustomName(ctx, grpcSettings.getServiceName(), grpcSettings.getTunMultiStreamName())
 		if err != nil {
-			return nil, newError("Cannot dial gRPC").Base(err)
+			return nil, errors.New("Cannot dial gRPC").Base(err)
 		}
-		return encoding.NewMultiHunkConn(grpcService, nil), nil
+		return encoding.NewMultiHunkConn(grpcService, nil, nil), nil
 	}
 
-	grpcService, err := client.(encoding.GRPCServiceClientX).TunCustomName(ctx, grpcSettings.getNormalizedName())
+	errors.LogDebug(ctx, "using gRPC tun mode service name: `"+grpcSettings.getServiceName()+"` stream name: `"+grpcSettings.getTunStreamName()+"`")
+	grpcService, err := client.(encoding.GRPCServiceClientX).TunCustomName(ctx, grpcSettings.getServiceName(), grpcSettings.getTunStreamName())
 	if err != nil {
-		return nil, newError("Cannot dial gRPC").Base(err)
+		return nil, errors.New("Cannot dial gRPC").Base(err)
 	}
 
-	return encoding.NewHunkConn(grpcService, nil), nil
+	return encoding.NewHunkConn(grpcService, nil, nil), nil
 }
 
 func getGrpcClient(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (*grpc.ClientConn, error) {
@@ -77,7 +82,7 @@ func getGrpcClient(ctx context.Context, dest net.Destination, streamSettings *in
 		globalDialerMap = make(map[dialerConf]*grpc.ClientConn)
 	}
 	tlsConfig := tls.ConfigFromStreamSettings(streamSettings)
-	sockopt := streamSettings.SocketSettings
+	realityConfig := reality.ConfigFromStreamSettings(streamSettings)
 	grpcSettings := streamSettings.ProtocolSettings.(*Config)
 
 	if client, found := globalDialerMap[dialerConf{dest, streamSettings}]; found && client.GetState() != connectivity.Shutdown {
@@ -94,17 +99,14 @@ func getGrpcClient(ctx context.Context, dest net.Destination, streamSettings *in
 			},
 			MinConnectTimeout: 5 * time.Second,
 		}),
-		grpc.WithContextDialer(func(gctx context.Context, s string) (gonet.Conn, error) {
-			gctx = session.ContextWithID(gctx, session.IDFromContext(ctx))
-			gctx = session.ContextWithOutbound(gctx, session.OutboundFromContext(ctx))
-
-			rawHost, rawPort, err := net.SplitHostPort(s)
+		grpc.WithContextDialer(func(gctx context.Context, s string) (net.Conn, error) {
 			select {
 			case <-gctx.Done():
 				return nil, gctx.Err()
 			default:
 			}
 
+			rawHost, rawPort, err := net.SplitHostPort(s)
 			if err != nil {
 				return nil, err
 			}
@@ -116,21 +118,45 @@ func getGrpcClient(ctx context.Context, dest net.Destination, streamSettings *in
 				return nil, err
 			}
 			address := net.ParseAddress(rawHost)
-			return internet.DialSystem(gctx, net.TCPDestination(address, port), sockopt)
+
+			gctx = c.ContextWithID(gctx, c.IDFromContext(ctx))
+			gctx = session.ContextWithOutbounds(gctx, session.OutboundsFromContext(ctx))
+			gctx = session.ContextWithTimeoutOnly(gctx, true)
+
+			var c net.Conn
+			if streamSettings.FinalMask != nil {
+				c, err = streamSettings.FinalMask.DialTCP(gctx, net.TCPDestination(address, port))
+			} else {
+				c, err = internet.DialSystem(gctx, net.TCPDestination(address, port), streamSettings.SocketSettings)
+			}
+			if err == nil {
+				if tlsConfig != nil {
+					config := tlsConfig.GetTLSConfig(tls.WithDestination(dest))
+					if fingerprint := tls.GetFingerprint(tlsConfig.Fingerprint); fingerprint != nil {
+						return tls.UClient(c, config, fingerprint), nil
+					} else { // Fallback to normal gRPC TLS
+						return tls.Client(c, config), nil
+					}
+				}
+				if realityConfig != nil {
+					return reality.UClient(c, realityConfig, gctx, dest)
+				}
+			}
+			return c, err
 		}),
 	}
 
-	if tlsConfig != nil {
-		var transportCredential credentials.TransportCredentials
-		if fingerprint, exists := tls.Fingerprints[tlsConfig.Fingerprint]; exists {
-			transportCredential = tls.NewGrpcUtls(tlsConfig.GetTLSConfig(), fingerprint)
-		} else { // Fallback to normal gRPC TLS
-			transportCredential = credentials.NewTLS(tlsConfig.GetTLSConfig())
-		}
-		dialOptions = append(dialOptions, grpc.WithTransportCredentials(transportCredential))
-	} else {
-		dialOptions = append(dialOptions, grpc.WithInsecure())
+	dialOptions = append(dialOptions, grpc.WithTransportCredentials(insecure.NewCredentials()))
+
+	authority := ""
+	if grpcSettings.Authority != "" {
+		authority = grpcSettings.Authority
+	} else if tlsConfig != nil && tlsConfig.ServerName != "" {
+		authority = tlsConfig.ServerName
+	} else if realityConfig == nil && dest.Address.Family().IsDomain() {
+		authority = dest.Address.Domain()
 	}
+	dialOptions = append(dialOptions, grpc.WithAuthority(authority))
 
 	if grpcSettings.IdleTimeout > 0 || grpcSettings.HealthCheckTimeout > 0 || grpcSettings.PermitWithoutStream {
 		dialOptions = append(dialOptions, grpc.WithKeepaliveParams(keepalive.ClientParameters{
@@ -151,10 +177,34 @@ func getGrpcClient(ctx context.Context, dest net.Destination, streamSettings *in
 		grpcDestHost = dest.Address.IP().String()
 	}
 
-	conn, err := grpc.Dial(
-		gonet.JoinHostPort(grpcDestHost, dest.Port.String()),
+	conn, err := grpc.NewClient(
+		"passthrough:///"+net.JoinHostPort(grpcDestHost, dest.Port.String()),
 		dialOptions...,
 	)
+	if err == nil {
+		userAgent := grpcSettings.UserAgent
+		// It's NOT recommended to set the UA of gRPC connections to that of real browsers, as they are fundamentally incapable of initiating real gRPC connections.
+		switch userAgent {
+		case "chrome", "":
+			userAgent = utils.ChromeUA
+		case "firefox":
+			userAgent = utils.FirefoxUA
+		case "edge":
+			userAgent = utils.MSEdgeUA
+		case "golang":
+			userAgent = ""
+		}
+		setUserAgent(conn, userAgent)
+		conn.Connect()
+	}
 	globalDialerMap[dialerConf{dest, streamSettings}] = conn
 	return conn, err
+}
+
+// setUserAgent overrides the user-agent on a ClientConn to remove the
+// "grpc-go/version" suffix that grpc.WithUserAgent unconditionally appends.
+func setUserAgent(conn *grpc.ClientConn, ua string) {
+	if f := reflect.ValueOf(conn).Elem().FieldByName("dopts").FieldByName("copts").FieldByName("UserAgent"); f.IsValid() {
+		*(*string)(f.Addr().UnsafePointer()) = ua
+	}
 }

@@ -75,9 +75,10 @@ func (w *BufferToBytesWriter) ReadFrom(reader io.Reader) (int64, error) {
 // BufferedWriter is a Writer with internal buffer.
 type BufferedWriter struct {
 	sync.Mutex
-	writer   Writer
-	buffer   *Buffer
-	buffered bool
+	writer    Writer
+	buffer    *Buffer
+	buffered  bool
+	flushNext bool
 }
 
 // NewBufferedWriter creates a new BufferedWriter.
@@ -117,7 +118,9 @@ func (w *BufferedWriter) Write(b []byte) (int, error) {
 
 		nBytes, err := w.buffer.Write(b)
 		totalBytes += nBytes
-		if err != nil {
+
+		// ErrBufferFull means a partial write, so flush below and continue
+		if err != nil && err != ErrBufferFull {
 			return totalBytes, err
 		}
 		if !w.buffered || w.buffer.IsFull() {
@@ -161,6 +164,12 @@ func (w *BufferedWriter) WriteMultiBuffer(b MultiBuffer) error {
 		}
 	}
 
+	if w.flushNext {
+		w.buffered = false
+		w.flushNext = false
+		return w.flushInternal()
+	}
+
 	return nil
 }
 
@@ -201,6 +210,13 @@ func (w *BufferedWriter) SetBuffered(f bool) error {
 	return nil
 }
 
+// SetFlushNext will wait the next WriteMultiBuffer to flush and set buffered = false
+func (w *BufferedWriter) SetFlushNext() {
+	w.Lock()
+	defer w.Unlock()
+	w.flushNext = true
+}
+
 // ReadFrom implements io.ReaderFrom.
 func (w *BufferedWriter) ReadFrom(reader io.Reader) (int64, error) {
 	if err := w.SetBuffered(false); err != nil {
@@ -218,6 +234,10 @@ func (w *BufferedWriter) Close() error {
 		return err
 	}
 	return common.Close(w.writer)
+}
+
+func (w *BufferedWriter) Interrupt() {
+	common.Interrupt(w.writer)
 }
 
 // SequentialWriter is a Writer that writes MultiBuffer sequentially into the underlying io.Writer.

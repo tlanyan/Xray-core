@@ -3,7 +3,6 @@ package pipe
 import (
 	"errors"
 	"io"
-	"runtime"
 	"sync"
 	"time"
 
@@ -24,7 +23,6 @@ const (
 type pipeOption struct {
 	limit           int32 // maximum buffer size in bytes
 	discardOverflow bool
-	onTransmission  func(buffer buf.MultiBuffer) buf.MultiBuffer
 }
 
 func (o *pipeOption) isFull(curSize int32) bool {
@@ -37,6 +35,7 @@ type pipe struct {
 	readSignal  *signal.Notifier
 	writeSignal *signal.Notifier
 	done        *done.Instance
+	errChan     chan error
 	option      pipeOption
 	state       state
 }
@@ -45,6 +44,14 @@ var (
 	errBufferFull = errors.New("buffer full")
 	errSlowDown   = errors.New("slow down")
 )
+
+func (p *pipe) Len() int32 {
+	data := p.data
+	if data == nil {
+		return 0
+	}
+	return data.Len()
+}
 
 func (p *pipe) getState(forRead bool) error {
 	switch p.state {
@@ -92,6 +99,8 @@ func (p *pipe) ReadMultiBuffer() (buf.MultiBuffer, error) {
 		select {
 		case <-p.readSignal.Wait():
 		case <-p.done.Wait():
+		case err = <-p.errChan:
+			return nil, err
 		}
 	}
 }
@@ -126,20 +135,15 @@ func (p *pipe) writeMultiBufferInternal(mb buf.MultiBuffer) error {
 
 	if p.data == nil {
 		p.data = mb
-		return nil
+	} else {
+		p.data, _ = buf.MergeMulti(p.data, mb)
 	}
-
-	p.data, _ = buf.MergeMulti(p.data, mb)
-	return errSlowDown
+	return nil
 }
 
 func (p *pipe) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	if mb.IsEmpty() {
 		return nil
-	}
-
-	if p.option.onTransmission != nil {
-		mb = p.option.onTransmission(mb)
 	}
 
 	for {
@@ -149,30 +153,23 @@ func (p *pipe) WriteMultiBuffer(mb buf.MultiBuffer) error {
 			return nil
 		}
 
-		if err == errSlowDown {
-			p.readSignal.Signal()
-
-			// Yield current goroutine. Hopefully the reading counterpart can pick up the payload.
-			runtime.Gosched()
-			return nil
+		if err == errBufferFull {
+			if p.option.discardOverflow {
+				buf.ReleaseMulti(mb)
+				return nil
+			}
+			select {
+			case <-p.writeSignal.Wait():
+				continue
+			case <-p.done.Wait():
+				buf.ReleaseMulti(mb)
+				return io.ErrClosedPipe
+			}
 		}
 
-		if err == errBufferFull && p.option.discardOverflow {
-			buf.ReleaseMulti(mb)
-			return nil
-		}
-
-		if err != errBufferFull {
-			buf.ReleaseMulti(mb)
-			p.readSignal.Signal()
-			return err
-		}
-
-		select {
-		case <-p.writeSignal.Wait():
-		case <-p.done.Wait():
-			return io.ErrClosedPipe
-		}
+		buf.ReleaseMulti(mb)
+		p.readSignal.Signal()
+		return err
 	}
 }
 
@@ -194,16 +191,19 @@ func (p *pipe) Interrupt() {
 	p.Lock()
 	defer p.Unlock()
 
+	if !p.data.IsEmpty() {
+		buf.ReleaseMulti(p.data)
+		p.data = nil
+		if p.state == closed {
+			p.state = errord
+		}
+	}
+
 	if p.state == closed || p.state == errord {
 		return
 	}
 
 	p.state = errord
-
-	if !p.data.IsEmpty() {
-		buf.ReleaseMulti(p.data)
-		p.data = nil
-	}
 
 	common.Must(p.done.Close())
 }

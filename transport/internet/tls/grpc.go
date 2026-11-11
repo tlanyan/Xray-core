@@ -14,7 +14,7 @@ import (
 // grpcUtlsInfo contains the auth information for a TLS authenticated connection.
 // It implements the AuthInfo interface.
 type grpcUtlsInfo struct {
-	State utls.ConnectionState
+	State gotls.ConnectionState
 	credentials.CommonAuthInfo
 	// This API is experimental.
 	SPIFFEID *url.URL
@@ -65,7 +65,7 @@ func (c *grpcUtls) ClientHandshake(ctx context.Context, authority string, rawCon
 	conn := UClient(rawConn, cfg, c.fingerprint).(*UConn)
 	errChannel := make(chan error, 1)
 	go func() {
-		errChannel <- conn.Handshake()
+		errChannel <- conn.HandshakeContext(ctx)
 		close(errChannel)
 	}()
 	select {

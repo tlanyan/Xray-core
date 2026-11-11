@@ -1,7 +1,5 @@
 package inbound
 
-//go:generate go run github.com/xtls/xray-core/common/errors/errorgen
-
 import (
 	"context"
 	"io"
@@ -14,7 +12,6 @@ import (
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/log"
 	"github.com/xtls/xray-core/common/net"
-	"github.com/xtls/xray-core/common/platform"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/common/signal"
@@ -29,23 +26,16 @@ import (
 	"github.com/xtls/xray-core/transport/internet/stat"
 )
 
-var (
-	aeadForced     = false
-	aeadForced2022 = false
-)
-
 type userByEmail struct {
 	sync.Mutex
-	cache           map[string]*protocol.MemoryUser
-	defaultLevel    uint32
-	defaultAlterIDs uint16
+	cache        map[string]*protocol.MemoryUser
+	defaultLevel uint32
 }
 
 func newUserByEmail(config *DefaultConfig) *userByEmail {
 	return &userByEmail{
-		cache:           make(map[string]*protocol.MemoryUser),
-		defaultLevel:    config.Level,
-		defaultAlterIDs: uint16(config.AlterId),
+		cache:        make(map[string]*protocol.MemoryUser),
+		defaultLevel: config.Level,
 	}
 }
 
@@ -66,7 +56,7 @@ func (v *userByEmail) Add(u *protocol.MemoryUser) bool {
 	return v.addNoLock(u)
 }
 
-func (v *userByEmail) Get(email string) (*protocol.MemoryUser, bool) {
+func (v *userByEmail) GetOrGenerate(email string) (*protocol.MemoryUser, bool) {
 	email = strings.ToLower(email)
 
 	v.Lock()
@@ -76,8 +66,7 @@ func (v *userByEmail) Get(email string) (*protocol.MemoryUser, bool) {
 	if !found {
 		id := uuid.New()
 		rawAccount := &vmess.Account{
-			Id:      id.String(),
-			AlterId: uint32(v.defaultAlterIDs),
+			Id: id.String(),
 		}
 		account, err := rawAccount.AsAccount()
 		common.Must(err)
@@ -89,6 +78,13 @@ func (v *userByEmail) Get(email string) (*protocol.MemoryUser, bool) {
 		v.cache[email] = user
 	}
 	return user, found
+}
+
+func (v *userByEmail) Get(email string) *protocol.MemoryUser {
+	email = strings.ToLower(email)
+	v.Lock()
+	defer v.Unlock()
+	return v.cache[email]
 }
 
 func (v *userByEmail) Remove(email string) bool {
@@ -110,9 +106,7 @@ type Handler struct {
 	inboundHandlerManager feature_inbound.Manager
 	clients               *vmess.TimedUserValidator
 	usersByEmail          *userByEmail
-	detours               *DetourConfig
 	sessionHistory        *encoding.SessionHistory
-	secure                bool
 }
 
 // New creates a new VMess inbound handler.
@@ -121,21 +115,19 @@ func New(ctx context.Context, config *Config) (*Handler, error) {
 	handler := &Handler{
 		policyManager:         v.GetFeature(policy.ManagerType()).(policy.Manager),
 		inboundHandlerManager: v.GetFeature(feature_inbound.ManagerType()).(feature_inbound.Manager),
-		clients:               vmess.NewTimedUserValidator(protocol.DefaultIDHash),
-		detours:               config.Detour,
+		clients:               vmess.NewTimedUserValidator(),
 		usersByEmail:          newUserByEmail(config.GetDefaultValue()),
 		sessionHistory:        encoding.NewSessionHistory(),
-		secure:                config.SecureEncryptionOnly,
 	}
 
 	for _, user := range config.User {
 		mUser, err := user.ToMemoryUser()
 		if err != nil {
-			return nil, newError("failed to get VMess user").Base(err)
+			return nil, errors.New("failed to get VMess user").Base(err)
 		}
 
 		if err := handler.AddUser(ctx, mUser); err != nil {
-			return nil, newError("failed to initiate user").Base(err)
+			return nil, errors.New("failed to initiate user").Base(err)
 		}
 	}
 
@@ -145,9 +137,9 @@ func New(ctx context.Context, config *Config) (*Handler, error) {
 // Close implements common.Closable.
 func (h *Handler) Close() error {
 	return errors.Combine(
-		h.clients.Close(),
 		h.sessionHistory.Close(),
-		common.Close(h.usersByEmail))
+		common.Close(h.usersByEmail),
+	)
 }
 
 // Network implements proxy.Inbound.Network().
@@ -155,27 +147,39 @@ func (*Handler) Network() []net.Network {
 	return []net.Network{net.Network_TCP, net.Network_UNIX}
 }
 
-func (h *Handler) GetUser(email string) *protocol.MemoryUser {
-	user, existing := h.usersByEmail.Get(email)
+func (h *Handler) GetOrGenerateUser(email string) *protocol.MemoryUser {
+	user, existing := h.usersByEmail.GetOrGenerate(email)
 	if !existing {
 		h.clients.Add(user)
 	}
 	return user
 }
 
+func (h *Handler) GetUser(ctx context.Context, email string) *protocol.MemoryUser {
+	return h.usersByEmail.Get(email)
+}
+
+func (h *Handler) GetUsers(ctx context.Context) []*protocol.MemoryUser {
+	return h.clients.GetUsers()
+}
+
+func (h *Handler) GetUsersCount(context.Context) int64 {
+	return h.clients.GetCount()
+}
+
 func (h *Handler) AddUser(ctx context.Context, user *protocol.MemoryUser) error {
 	if len(user.Email) > 0 && !h.usersByEmail.Add(user) {
-		return newError("User ", user.Email, " already exists.")
+		return errors.New("User ", user.Email, " already exists.")
 	}
 	return h.clients.Add(user)
 }
 
 func (h *Handler) RemoveUser(ctx context.Context, email string) error {
 	if email == "" {
-		return newError("Email must not be empty.")
+		return errors.New("Email must not be empty.")
 	}
 	if !h.usersByEmail.Remove(email) {
-		return newError("User ", email, " not found.")
+		return errors.New("User ", email, " not found.")
 	}
 	h.clients.Remove(email)
 	return nil
@@ -186,7 +190,7 @@ func transferResponse(timer signal.ActivityUpdater, session *encoding.ServerSess
 
 	bodyWriter, err := session.EncodeResponseBody(request, output)
 	if err != nil {
-		return newError("failed to start decoding response").Base(err)
+		return errors.New("failed to start decoding response").Base(err)
 	}
 	{
 		// Optimize for small response packet
@@ -219,21 +223,14 @@ func transferResponse(timer signal.ActivityUpdater, session *encoding.ServerSess
 	return nil
 }
 
-func isInsecureEncryption(s protocol.SecurityType) bool {
-	return s == protocol.SecurityType_NONE || s == protocol.SecurityType_LEGACY || s == protocol.SecurityType_UNKNOWN
-}
-
 // Process implements proxy.Inbound.Process().
 func (h *Handler) Process(ctx context.Context, network net.Network, connection stat.Connection, dispatcher routing.Dispatcher) error {
 	sessionPolicy := h.policyManager.ForLevel(0)
 	if err := connection.SetReadDeadline(time.Now().Add(sessionPolicy.Timeouts.Handshake)); err != nil {
-		return newError("unable to set read deadline").Base(err).AtWarning()
+		return errors.New("unable to set read deadline").Base(err)
 	}
 
-	iConn := connection
-	if statConn, ok := iConn.(*stat.CounterConnection); ok {
-		iConn = statConn.Connection
-	}
+	iConn := stat.TryUnwrapStatsConn(connection)
 	_, isDrain := iConn.(*net.TCPConn)
 	if !isDrain {
 		_, isDrain = iConn.(*net.UnixConn)
@@ -241,7 +238,6 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 
 	reader := &buf.BufferedReader{Reader: buf.NewReader(connection)}
 	svrSession := encoding.NewServerSession(h.clients, h.sessionHistory)
-	svrSession.SetAEADForced(aeadForced)
 	request, err := svrSession.DecodeRequestHeader(reader, isDrain)
 	if err != nil {
 		if errors.Cause(err) != io.EOF {
@@ -251,20 +247,9 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 				Status: log.AccessRejected,
 				Reason: err,
 			})
-			err = newError("invalid request from ", connection.RemoteAddr()).Base(err).AtInfo()
+			err = errors.New("invalid request from ", connection.RemoteAddr()).Base(err)
 		}
 		return err
-	}
-
-	if h.secure && isInsecureEncryption(request.Security) {
-		log.Record(&log.AccessMessage{
-			From:   connection.RemoteAddr(),
-			To:     "",
-			Status: log.AccessRejected,
-			Reason: "Insecure encryption",
-			Email:  request.User.Email,
-		})
-		return newError("client is using insecure encryption: ", request.Security)
 	}
 
 	if request.Command != protocol.RequestCommandMux {
@@ -277,16 +262,15 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 		})
 	}
 
-	newError("received request for ", request.Destination()).WriteToLog(session.ExportIDToError(ctx))
+	errors.LogInfo(ctx, "received request for ", request.Destination())
 
 	if err := connection.SetReadDeadline(time.Time{}); err != nil {
-		newError("unable to set back read deadline").Base(err).WriteToLog(session.ExportIDToError(ctx))
+		errors.LogInfoInner(ctx, err, "unable to set back read deadline")
 	}
 
 	inbound := session.InboundFromContext(ctx)
-	if inbound == nil {
-		panic("no inbound metadata")
-	}
+	inbound.Name = "vmess"
+	inbound.CanSpliceCopy = 3
 	inbound.User = request.User
 
 	sessionPolicy = h.policyManager.ForLevel(request.User.Level)
@@ -297,7 +281,7 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 	ctx = policy.ContextWithBufferPolicy(ctx, sessionPolicy.Buffer)
 	link, err := dispatcher.Dispatch(ctx, request.Destination())
 	if err != nil {
-		return newError("failed to dispatch request to ", request.Destination()).Base(err)
+		return errors.New("failed to dispatch request to ", request.Destination()).Base(err)
 	}
 
 	requestDone := func() error {
@@ -305,10 +289,10 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 
 		bodyReader, err := svrSession.DecodeRequestBody(request, reader)
 		if err != nil {
-			return newError("failed to start decoding").Base(err)
+			return errors.New("failed to start decoding").Base(err)
 		}
 		if err := buf.Copy(bodyReader, link.Writer, buf.UpdateActivity(timer)); err != nil {
-			return newError("failed to transfer request").Base(err)
+			return errors.New("failed to transfer request").Base(err)
 		}
 		return nil
 	}
@@ -329,45 +313,14 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 	if err := task.Run(ctx, requestDonePost, responseDone); err != nil {
 		common.Interrupt(link.Reader)
 		common.Interrupt(link.Writer)
-		return newError("connection ends").Base(err)
+		return errors.New("connection ends").Base(err)
 	}
 
 	return nil
 }
 
+// Stub command generator
 func (h *Handler) generateCommand(ctx context.Context, request *protocol.RequestHeader) protocol.ResponseCommand {
-	if h.detours != nil {
-		tag := h.detours.To
-		if h.inboundHandlerManager != nil {
-			handler, err := h.inboundHandlerManager.GetHandler(ctx, tag)
-			if err != nil {
-				newError("failed to get detour handler: ", tag).Base(err).AtWarning().WriteToLog(session.ExportIDToError(ctx))
-				return nil
-			}
-			proxyHandler, port, availableMin := handler.GetRandomInboundProxy()
-			inboundHandler, ok := proxyHandler.(*Handler)
-			if ok && inboundHandler != nil {
-				if availableMin > 255 {
-					availableMin = 255
-				}
-
-				newError("pick detour handler for port ", port, " for ", availableMin, " minutes.").AtDebug().WriteToLog(session.ExportIDToError(ctx))
-				user := inboundHandler.GetUser(request.User.Email)
-				if user == nil {
-					return nil
-				}
-				account := user.Account.(*vmess.MemoryAccount)
-				return &protocol.CommandSwitchAccount{
-					Port:     port,
-					ID:       account.ID.UUID(),
-					AlterIds: uint16(len(account.AlterIDs)),
-					Level:    user.Level,
-					ValidMin: byte(availableMin),
-				}
-			}
-		}
-	}
-
 	return nil
 }
 
@@ -375,18 +328,4 @@ func init() {
 	common.Must(common.RegisterConfig((*Config)(nil), func(ctx context.Context, config interface{}) (interface{}, error) {
 		return New(ctx, config.(*Config))
 	}))
-
-	defaultFlagValue := "NOT_DEFINED_AT_ALL"
-
-	if time.Now().Year() >= 2022 {
-		defaultFlagValue = "true_by_default_2022"
-	}
-
-	isAeadForced := platform.NewEnvFlag("xray.vmess.aead.forced").GetValue(func() string { return defaultFlagValue })
-	aeadForced = (isAeadForced == "true")
-
-	if isAeadForced == "true_by_default_2022" {
-		aeadForced = true
-		aeadForced2022 = true
-	}
 }

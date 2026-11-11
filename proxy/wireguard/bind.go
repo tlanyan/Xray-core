@@ -2,253 +2,161 @@ package wireguard
 
 import (
 	"context"
-	"errors"
+	goerrors "errors"
 	"io"
 	"net"
 	"net/netip"
 	"strconv"
 	"sync"
+	"syscall"
 
-	"github.com/sagernet/wireguard-go/conn"
-	xnet "github.com/xtls/xray-core/common/net"
-	"github.com/xtls/xray-core/features/dns"
-	"github.com/xtls/xray-core/transport/internet"
+	"github.com/xtls/xray-core/common"
+	"github.com/xtls/xray-core/common/errors"
+	"golang.zx2c4.com/wireguard/conn"
 )
 
-type netReadInfo struct {
-	// status
-	waiter sync.WaitGroup
-	// param
-	buff []byte
-	// result
-	bytes    int
-	endpoint conn.Endpoint
-	err      error
+type bind struct {
+	ctx         context.Context
+	resolveFunc func(ctx context.Context, host string) (net.IP, error)
+	listenFunc  func(ctx context.Context) (net.PacketConn, error)
+	downFunc    func() error
+	reserved    []byte
+
+	net.PacketConn
+	closeCh chan struct{}
+	mu      sync.Mutex
 }
 
-type netBindClient struct {
-	workers   int
-	dialer    internet.Dialer
-	dns       dns.Client
-	dnsOption dns.IPOption
-
-	readQueue chan *netReadInfo
+func (b *bind) SetCtx(ctx context.Context) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.ctx = ctx
 }
 
-func (n *netBindClient) ParseEndpoint(s string) (conn.Endpoint, error) {
-	ipStr, port, _, err := splitAddrPort(s)
+func (b *bind) Open(port uint16) (fns []conn.ReceiveFunc, actualPort uint16, err error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.PacketConn != nil {
+		return nil, 0, conn.ErrBindAlreadyOpen
+	}
+
+	c, err := b.listenFunc(b.ctx)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
+	b.PacketConn = c
+	ch := make(chan struct{})
+	b.closeCh = ch
 
-	var addr net.IP
-	if IsDomainName(ipStr) {
-		ips, err := n.dns.LookupIP(ipStr, n.dnsOption)
-		if err != nil {
-			return nil, err
-		} else if len(ips) == 0 {
-			return nil, dns.ErrEmptyResponse
-		}
-		addr = ips[0]
-	} else {
-		addr = net.ParseIP(ipStr)
-	}
-	if addr == nil {
-		return nil, errors.New("failed to parse ip: " + ipStr)
-	}
-
-	var ip xnet.Address
-	if p4 := addr.To4(); len(p4) == net.IPv4len {
-		ip = xnet.IPAddress(p4[:])
-	} else {
-		ip = xnet.IPAddress(addr[:])
-	}
-
-	dst := xnet.Destination{
-		Address: ip,
-		Port:    xnet.Port(port),
-		Network: xnet.Network_UDP,
-	}
-
-	return &netEndpoint{
-		dst: dst,
-	}, nil
-}
-
-func (bind *netBindClient) Open(uport uint16) ([]conn.ReceiveFunc, uint16, error) {
-	bind.readQueue = make(chan *netReadInfo)
-
-	fun := func(buff []byte) (cap int, ep conn.Endpoint, err error) {
-		defer func() {
-			if r := recover(); r != nil {
-				cap = 0
-				ep = nil
-				err = errors.New("channel closed")
+	return []conn.ReceiveFunc{
+		func(bufs [][]byte, sizes []int, eps []conn.Endpoint) (n int, err error) {
+			for {
+				n, addr, err := c.ReadFrom(bufs[0])
+				if err != nil {
+					if goerrors.Is(err, io.EOF) || goerrors.Is(err, io.ErrClosedPipe) || goerrors.Is(err, net.ErrClosed) {
+						select {
+						case <-ch:
+						default:
+							errors.LogErrorInner(context.Background(), err, "unexpected closed")
+							if b.downFunc != nil {
+								go func() {
+									common.Must(b.downFunc())
+								}()
+							}
+						}
+						return 0, net.ErrClosed
+					}
+					errors.LogErrorInner(context.Background(), err, "bind recv err")
+					continue
+				}
+				if n > 3 {
+					bufs[0][1] = 0
+					bufs[0][2] = 0
+					bufs[0][3] = 0
+				}
+				sizes[0] = n
+				eps[0] = &conn.StdNetEndpoint{AddrPort: addr.(*net.UDPAddr).AddrPort()}
+				return 1, nil
 			}
-		}()
-
-		r := &netReadInfo{
-			buff: buff,
-		}
-		r.waiter.Add(1)
-		bind.readQueue <- r
-		r.waiter.Wait() // wait read goroutine done, or we will miss the result
-		return r.bytes, r.endpoint, r.err
-	}
-	workers := bind.workers
-	if workers <= 0 {
-		workers = 1
-	}
-	arr := make([]conn.ReceiveFunc, workers)
-	for i := 0; i < workers; i++ {
-		arr[i] = fun
-	}
-
-	return arr, uint16(uport), nil
+		},
+	}, uint16(c.LocalAddr().(*net.UDPAddr).Port), nil
 }
 
-func (bind *netBindClient) Close() error {
-	if bind.readQueue != nil {
-		close(bind.readQueue)
+func (b *bind) Close() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.PacketConn != nil {
+		close(b.closeCh)
+		_ = b.PacketConn.Close()
+		b.PacketConn = nil
 	}
 	return nil
 }
 
-func (bind *netBindClient) connectTo(endpoint *netEndpoint) error {
-	c, err := bind.dialer.Dial(context.Background(), endpoint.dst)
-	if err != nil {
-		return err
-	}
-	endpoint.conn = c
-
-	go func(readQueue <-chan *netReadInfo, endpoint *netEndpoint) {
-		for {
-			v, ok := <-readQueue
-			if !ok {
-				return
-			}
-			i, err := c.Read(v.buff)
-			v.bytes = i
-			v.endpoint = endpoint
-			v.err = err
-			v.waiter.Done()
-			if err != nil && errors.Is(err, io.EOF) {
-				endpoint.conn = nil
-				return
-			}
-		}
-	}(bind.readQueue, endpoint)
-
+func (b *bind) SetMark(mark uint32) error {
 	return nil
 }
 
-func (bind *netBindClient) Send(buff []byte, endpoint conn.Endpoint) error {
-	var err error
+func (b *bind) Send(bufs [][]byte, ep conn.Endpoint) (err error) {
+	b.mu.Lock()
+	c := b.PacketConn
+	b.mu.Unlock()
 
-	nend, ok := endpoint.(*netEndpoint)
-	if !ok {
-		return conn.ErrWrongEndpointType
+	if c == nil {
+		return syscall.EAFNOSUPPORT
 	}
 
-	if nend.conn == nil {
-		err = bind.connectTo(nend)
+	for i := range bufs {
+		if len(bufs[i]) > 3 && len(b.reserved) == 3 {
+			bufs[i][1] = b.reserved[0]
+			bufs[i][2] = b.reserved[1]
+			bufs[i][3] = b.reserved[2]
+		}
+		_, err = c.WriteTo(bufs[i], net.UDPAddrFromAddrPort(ep.(*conn.StdNetEndpoint).AddrPort))
 		if err != nil {
-			return err
+			errors.LogErrorInner(context.Background(), err, "bind send err")
+			break
 		}
 	}
-
-	_, err = nend.conn.Write(buff)
-
 	return err
 }
 
-func (bind *netBindClient) SetMark(mark uint32) error {
-	return nil
-}
-
-type netEndpoint struct {
-	dst  xnet.Destination
-	conn net.Conn
-}
-
-func (netEndpoint) ClearSrc() {}
-
-func (e netEndpoint) DstIP() netip.Addr {
-	return toNetIpAddr(e.dst.Address)
-}
-
-func (e netEndpoint) SrcIP() netip.Addr {
-	return netip.Addr{}
-}
-
-func (e netEndpoint) DstToBytes() []byte {
-	var dat []byte
-	if e.dst.Address.Family().IsIPv4() {
-		dat = e.dst.Address.IP().To4()[:]
-	} else {
-		dat = e.dst.Address.IP().To16()[:]
-	}
-	dat = append(dat, byte(e.dst.Port), byte(e.dst.Port>>8))
-	return dat
-}
-
-func (e netEndpoint) DstToString() string {
-	return e.dst.NetAddr()
-}
-
-func (e netEndpoint) SrcToString() string {
-	return ""
-}
-
-func toNetIpAddr(addr xnet.Address) netip.Addr {
-	if addr.Family().IsIPv4() {
-		ip := addr.IP()
-		return netip.AddrFrom4([4]byte{ip[0], ip[1], ip[2], ip[3]})
-	} else {
-		ip := addr.IP()
-		arr := [16]byte{}
-		for i := 0; i < 16; i++ {
-			arr[i] = ip[i]
+func (b *bind) ParseEndpoint(s string) (conn.Endpoint, error) {
+	if b.resolveFunc == nil {
+		e, err := netip.ParseAddrPort(s)
+		if err != nil {
+			return nil, err
 		}
-		return netip.AddrFrom16(arr)
+		return &conn.StdNetEndpoint{
+			AddrPort: e,
+		}, nil
 	}
-}
-
-func stringsLastIndexByte(s string, b byte) int {
-	for i := len(s) - 1; i >= 0; i-- {
-		if s[i] == b {
-			return i
-		}
-	}
-	return -1
-}
-
-func splitAddrPort(s string) (ip string, port uint16, v6 bool, err error) {
-	i := stringsLastIndexByte(s, ':')
-	if i == -1 {
-		return "", 0, false, errors.New("not an ip:port")
-	}
-
-	ip = s[:i]
-	portStr := s[i+1:]
-	if len(ip) == 0 {
-		return "", 0, false, errors.New("no IP")
-	}
-	if len(portStr) == 0 {
-		return "", 0, false, errors.New("no port")
-	}
-	port64, err := strconv.ParseUint(portStr, 10, 16)
+	host, sport, err := net.SplitHostPort(s)
 	if err != nil {
-		return "", 0, false, errors.New("invalid port " + strconv.Quote(portStr) + " parsing " + strconv.Quote(s))
+		return nil, err
 	}
-	port = uint16(port64)
-	if ip[0] == '[' {
-		if len(ip) < 2 || ip[len(ip)-1] != ']' {
-			return "", 0, false, errors.New("missing ]")
-		}
-		ip = ip[1 : len(ip)-1]
-		v6 = true
+	port, err := strconv.Atoi(sport)
+	if err != nil {
+		return nil, err
 	}
+	if port < 0 || port > 65535 {
+		return nil, errors.New("invalid port " + sport)
+	}
+	// up sets the connection's context right before it hands over the endpoint
+	b.mu.Lock()
+	ctx := b.ctx
+	b.mu.Unlock()
+	ip, err := b.resolveFunc(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	addr, _ := netip.AddrFromSlice(ip)
+	return &conn.StdNetEndpoint{
+		AddrPort: netip.AddrPortFrom(addr, uint16(port)),
+	}, nil
+}
 
-	return ip, port, v6, nil
+func (b *bind) BatchSize() int {
+	return 1
 }

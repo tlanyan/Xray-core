@@ -11,7 +11,6 @@ import "common/protocol/server_spec.proto";
 
 message Account {
   string password = 1;
-  string flow = 2;
 }
 
 message Fallback {
@@ -24,10 +23,10 @@ message Fallback {
 }
 
 message ClientConfig {
-  repeated xray.common.protocol.ServerEndpoint server = 1;
+  xray.common.protocol.ServerEndpoint server = 1;
 }
 
 message ServerConfig {
   repeated xray.common.protocol.User users = 1;
-  repeated Fallback fallbacks = 3;
+  repeated Fallback fallbacks = 2;
 }

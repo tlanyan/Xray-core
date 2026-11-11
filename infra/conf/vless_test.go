@@ -26,7 +26,7 @@ func TestVLessOutbound(t *testing.T) {
 					"users": [
 						{
 							"id": "27848739-7e62-4138-9fd3-098a63964b6b",
-							"flow": "xtls-rprx-direct-udp443",
+							"flow": "xtls-rprx-vision-udp443",
 							"encryption": "none",
 							"level": 0
 						}
@@ -35,24 +35,49 @@ func TestVLessOutbound(t *testing.T) {
 			}`,
 			Parser: loadJSON(creator),
 			Output: &outbound.Config{
-				Vnext: []*protocol.ServerEndpoint{
-					{
-						Address: &net.IPOrDomain{
-							Address: &net.IPOrDomain_Domain{
-								Domain: "example.com",
-							},
+				Vnext: &protocol.ServerEndpoint{
+					Address: &net.IPOrDomain{
+						Address: &net.IPOrDomain_Domain{
+							Domain: "example.com",
 						},
-						Port: 443,
-						User: []*protocol.User{
-							{
-								Account: serial.ToTypedMessage(&vless.Account{
-									Id:         "27848739-7e62-4138-9fd3-098a63964b6b",
-									Flow:       "xtls-rprx-direct-udp443",
-									Encryption: "none",
-								}),
-								Level: 0,
-							},
+					},
+					Port: 443,
+					User: &protocol.User{
+						Account: serial.ToTypedMessage(&vless.Account{
+							Id:         "27848739-7e62-4138-9fd3-098a63964b6b",
+							Flow:       "xtls-rprx-vision-udp443",
+							Encryption: "none",
+						}),
+						Level: 0,
+					},
+				},
+			},
+		},
+		{
+			Input: `{
+				"address": "example.com",
+				"port": 443,
+				"id": "27848739-7e62-4138-9fd3-098a63964b6b",
+				"flow": "xtls-rprx-vision-udp443",
+				"encryption": "none",
+				"level": 0
+			}`,
+			Parser: loadJSON(creator),
+			Output: &outbound.Config{
+				Vnext: &protocol.ServerEndpoint{
+					Address: &net.IPOrDomain{
+						Address: &net.IPOrDomain_Domain{
+							Domain: "example.com",
 						},
+					},
+					Port: 443,
+					User: &protocol.User{
+						Account: serial.ToTypedMessage(&vless.Account{
+							Id:         "27848739-7e62-4138-9fd3-098a63964b6b",
+							Flow:       "xtls-rprx-vision-udp443",
+							Encryption: "none",
+						}),
+						Level: 0,
 					},
 				},
 			},
@@ -71,7 +96,7 @@ func TestVLessInbound(t *testing.T) {
 				"clients": [
 					{
 						"id": "27848739-7e62-4138-9fd3-098a63964b6b",
-						"flow": "xtls-rprx-direct",
+						"flow": "xtls-rprx-vision",
 						"level": 0,
 						"email": "love@example.com"
 					}
@@ -94,11 +119,11 @@ func TestVLessInbound(t *testing.T) {
 			}`,
 			Parser: loadJSON(creator),
 			Output: &inbound.Config{
-				Clients: []*protocol.User{
+				Users: []*protocol.User{
 					{
 						Account: serial.ToTypedMessage(&vless.Account{
 							Id:   "27848739-7e62-4138-9fd3-098a63964b6b",
-							Flow: "xtls-rprx-direct",
+							Flow: "xtls-rprx-vision",
 						}),
 						Level: 0,
 						Email: "love@example.com",
@@ -110,7 +135,7 @@ func TestVLessInbound(t *testing.T) {
 						Alpn: "",
 						Path: "",
 						Type: "tcp",
-						Dest: "127.0.0.1:80",
+						Dest: "localhost:80",
 						Xver: 0,
 					},
 					{

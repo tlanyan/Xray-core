@@ -1,145 +1,180 @@
 package shadowsocks_2022
 
 import (
-	"io"
+	"context"
 
-	B "github.com/sagernet/sing/common/buf"
-	E "github.com/sagernet/sing/common/exceptions"
-	M "github.com/sagernet/sing/common/metadata"
+	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
+	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/log"
 	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/session"
+	"github.com/xtls/xray-core/common/signal"
+	"github.com/xtls/xray-core/features/policy"
+	"github.com/xtls/xray-core/features/routing"
+	"github.com/xtls/xray-core/proxy"
+	"github.com/xtls/xray-core/transport"
+	"github.com/xtls/xray-core/transport/internet/stat"
 )
 
-//go:generate go run github.com/xtls/xray-core/common/errors/errorgen
+func (s *ServerUDPSession) UpdateConn(conn stat.Connection) {
+	s.currentConn.Store(conn)
+	s.timer.Update()
+}
 
-func toDestination(socksaddr M.Socksaddr, network net.Network) net.Destination {
-	if socksaddr.IsFqdn() {
-		return net.Destination{
-			Network: network,
-			Address: net.DomainAddress(socksaddr.Fqdn),
-			Port:    net.Port(socksaddr.Port),
-		}
-	} else {
-		return net.Destination{
-			Network: network,
-			Address: net.IPAddress(socksaddr.Addr.AsSlice()),
-			Port:    net.Port(socksaddr.Port),
-		}
+func (s *ServerUDPSession) WriteToClient(b []byte) error {
+	connVal := s.currentConn.Load()
+	if connVal == nil {
+		return errors.New("client connection closed")
 	}
-}
-
-func toSocksaddr(destination net.Destination) M.Socksaddr {
-	var addr M.Socksaddr
-	switch destination.Address.Family() {
-	case net.AddressFamilyDomain:
-		addr.Fqdn = destination.Address.Domain()
-	default:
-		addr.Addr = M.AddrFromIP(destination.Address.IP())
+	conn, ok := connVal.(stat.Connection)
+	if !ok || conn == nil {
+		return errors.New("client connection closed")
 	}
-	addr.Port = uint16(destination.Port)
-	return addr
-}
-
-type pipeConnWrapper struct {
-	R io.Reader
-	W buf.Writer
-	net.Conn
-}
-
-func (w *pipeConnWrapper) Close() error {
-	return nil
-}
-
-func (w *pipeConnWrapper) Read(b []byte) (n int, err error) {
-	return w.R.Read(b)
-}
-
-func (w *pipeConnWrapper) Write(p []byte) (n int, err error) {
-	n = len(p)
-	var mb buf.MultiBuffer
-	pLen := len(p)
-	for pLen > 0 {
-		buffer := buf.New()
-		if pLen > buf.Size {
-			_, err = buffer.Write(p[:buf.Size])
-			p = p[buf.Size:]
-		} else {
-			buffer.Write(p)
-		}
-		pLen -= int(buffer.Len())
-		mb = append(mb, buffer)
-	}
-	err = w.W.WriteMultiBuffer(mb)
-	if err != nil {
-		n = 0
-		buf.ReleaseMulti(mb)
-	}
-	return
-}
-
-type packetConnWrapper struct {
-	buf.Reader
-	buf.Writer
-	net.Conn
-	Dest   net.Destination
-	cached buf.MultiBuffer
-}
-
-func (w *packetConnWrapper) ReadPacket(buffer *B.Buffer) (M.Socksaddr, error) {
-	if w.cached != nil {
-		mb, bb := buf.SplitFirst(w.cached)
-		if bb == nil {
-			w.cached = nil
-		} else {
-			buffer.Write(bb.Bytes())
-			w.cached = mb
-			var destination net.Destination
-			if bb.UDP != nil {
-				destination = *bb.UDP
-			} else {
-				destination = w.Dest
-			}
-			bb.Release()
-			return toSocksaddr(destination), nil
-		}
-	}
-	mb, err := w.ReadMultiBuffer()
-	if err != nil {
-		return M.Socksaddr{}, err
-	}
-	nb, bb := buf.SplitFirst(mb)
-	if bb == nil {
-		return M.Socksaddr{}, nil
-	} else {
-		buffer.Write(bb.Bytes())
-		w.cached = nb
-		var destination net.Destination
-		if bb.UDP != nil {
-			destination = *bb.UDP
-		} else {
-			destination = w.Dest
-		}
-		bb.Release()
-		return toSocksaddr(destination), nil
-	}
-}
-
-func (w *packetConnWrapper) WritePacket(buffer *B.Buffer, destination M.Socksaddr) error {
-	vBuf := buf.New()
-	vBuf.Write(buffer.Bytes())
-	endpoint := toDestination(destination, net.Network_UDP)
-	vBuf.UDP = &endpoint
-	return w.Writer.WriteMultiBuffer(buf.MultiBuffer{vBuf})
-}
-
-func (w *packetConnWrapper) Close() error {
-	buf.ReleaseMulti(w.cached)
-	return nil
-}
-
-func returnError(err error) error {
-	if E.IsClosed(err) {
-		return nil
-	}
+	_, err := conn.Write(b)
 	return err
 }
+
+func (s *ServerUDPSession) Close() {
+	if s.timer != nil {
+		s.timer.SetTimeout(0)
+	}
+	if link := s.link.Load(); link != nil {
+		common.Interrupt(link.Reader)
+		common.Interrupt(link.Writer)
+	}
+}
+
+func (s *ServerUDPSession) EnsureLink(
+	ctx context.Context,
+	conn stat.Connection,
+	dest net.Destination,
+	dispatcher routing.Dispatcher,
+	policyManager policy.Manager,
+	responseEncoder func(dest net.Destination, payload []byte) ([]byte, error),
+) (*transport.Link, error) {
+	s.Lock()
+	defer s.Unlock()
+
+	if link := s.link.Load(); link != nil {
+		s.UpdateConn(conn)
+		return link, nil
+	}
+
+	s.currentConn.Store(conn)
+
+	sessCtx, cancel := context.WithCancel(ctx)
+	inbound := session.InboundFromContext(sessCtx)
+	if inbound != nil && s.User != nil {
+		inbound.User = s.User
+	}
+	var email string
+	var level uint32
+	if s.User != nil {
+		email = s.User.Email
+		level = s.User.Level
+	}
+	sessCtx = log.ContextWithAccessMessage(sessCtx, &log.AccessMessage{
+		From:   conn.RemoteAddr(),
+		To:     dest,
+		Status: log.AccessAccepted,
+		Email:  email,
+	})
+
+	link, err := dispatcher.Dispatch(sessCtx, dest)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+
+	sessionPolicy := policyManager.ForLevel(level)
+	s.timer = signal.CancelAfterInactivity(sessCtx, func() {
+		if s.manager != nil {
+			s.manager.Delete(s.SessionID)
+		}
+		s.Close()
+		cancel()
+	}, sessionPolicy.Timeouts.ConnectionIdle)
+	s.link.Store(link)
+
+	go handleUDPResponse(s, link, dest, responseEncoder)
+	return link, nil
+}
+
+// ResetTCPConn sets SO_LINGER to 0 per SIP022 §3.1.4 to consistently send RST on close
+// when handshake or header validation fails.
+func ResetTCPConn(conn net.Conn) {
+	rawConn, _, _ := proxy.UnwrapRawConn(conn)
+	if tcpConn, ok := rawConn.(*net.TCPConn); ok {
+		_ = tcpConn.SetLinger(0)
+	}
+}
+
+func handleUDPResponse(s *ServerUDPSession, link *transport.Link, fallbackDest net.Destination, encode func(dest net.Destination, payload []byte) ([]byte, error)) {
+	defer s.timer.SetTimeout(0)
+	for {
+		resMb, err := link.Reader.ReadMultiBuffer()
+		if err != nil {
+			return
+		}
+		s.timer.Update()
+		for i, rb := range resMb {
+			b := rb.Bytes()
+			if encode != nil {
+				replyDest := fallbackDest
+				if rb.UDP != nil {
+					replyDest = *rb.UDP
+				}
+				encPacket, err := encode(replyDest, b)
+				rb.Release()
+				if err != nil {
+					continue
+				}
+				if err := s.WriteToClient(encPacket); err != nil {
+					buf.ReleaseMulti(resMb[i+1:])
+					return
+				}
+			} else {
+				err := s.WriteToClient(b)
+				rb.Release()
+				if err != nil {
+					buf.ReleaseMulti(resMb[i+1:])
+					return
+				}
+			}
+		}
+	}
+}
+
+const (
+	HeaderTypeClient              = 0
+	HeaderTypeServer              = 1
+	MaxPaddingLength              = 900
+	PacketNonceSize               = 24
+	MaxPacketSize                 = 65535
+	RequestHeaderFixedChunkLength = 1 + 8 + 2 // Type (1B) + Timestamp (8B) + VarHeaderLen (2B)
+	PacketMinimalHeaderSize       = 30
+	StreamNonceSize               = 12
+	AESBlockSize                  = 16
+	AEADTagSize                   = 16
+)
+
+var zeroPadding [MaxPaddingLength]byte
+
+const (
+	MethodAES128GCM        = "2022-blake3-aes-128-gcm"
+	MethodAES256GCM        = "2022-blake3-aes-256-gcm"
+	MethodChaCha20Poly1305 = "2022-blake3-chacha20-poly1305"
+)
+
+var (
+	ErrBadKey            = errors.New("bad key")
+	ErrBadHeaderType     = errors.New("bad header type")
+	ErrBadTimestamp      = errors.New("bad timestamp")
+	ErrSaltNotUnique     = errors.New("salt not unique")
+	ErrPacketIdNotUnique = errors.New("packet id not unique")
+	ErrPacketTooShort    = errors.New("packet too short")
+	ErrPacketTooLarge    = errors.New("packet too large")
+	ErrNoPadding         = errors.New("bad request: missing payload or padding")
+	ErrInvalidRequest    = errors.New("invalid request")
+)

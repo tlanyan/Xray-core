@@ -3,40 +3,50 @@ package conf
 import (
 	"encoding/base64"
 	"encoding/hex"
+	"strconv"
+	"strings"
 
-	"github.com/golang/protobuf/proto"
+	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/protocol"
+	"github.com/xtls/xray-core/common/serial"
+	"github.com/xtls/xray-core/common/task"
 	"github.com/xtls/xray-core/proxy/wireguard"
+	"google.golang.org/protobuf/proto"
 )
 
 type WireGuardPeerConfig struct {
 	PublicKey    string   `json:"publicKey"`
 	PreSharedKey string   `json:"preSharedKey"`
 	Endpoint     string   `json:"endpoint"`
-	KeepAlive    int      `json:"keepAlive"`
+	KeepAlive    uint32   `json:"keepAlive"`
 	AllowedIPs   []string `json:"allowedIPs,omitempty"`
+
+	Level uint32 `json:"level"`
+	Email string `json:"email"`
 }
 
-func (c *WireGuardPeerConfig) Build() (proto.Message, error) {
+func (c *WireGuardPeerConfig) Build() (*wireguard.PeerConfig, error) {
 	var err error
 	config := new(wireguard.PeerConfig)
 
-	config.PublicKey, err = parseWireGuardKey(c.PublicKey)
-	if err != nil {
-		return nil, err
-	}
-
-	if c.PreSharedKey != "" {
-		config.PreSharedKey, err = parseWireGuardKey(c.PreSharedKey)
+	if c.PublicKey != "" {
+		config.PublicKey, err = ParseWireGuardKey(c.PublicKey)
 		if err != nil {
 			return nil, err
 		}
-	} else {
-		config.PreSharedKey = "0000000000000000000000000000000000000000000000000000000000000000"
+	}
+
+	if c.PreSharedKey != "" {
+		config.PreSharedKey, err = ParseWireGuardKey(c.PreSharedKey)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	config.Endpoint = c.Endpoint
-	// default 0
-	config.KeepAlive = int32(c.KeepAlive)
+	if c.KeepAlive != 0 {
+		config.KeepAlive = strconv.FormatUint(uint64(c.KeepAlive), 10)
+	}
 	if c.AllowedIPs == nil {
 		config.AllowedIps = []string{"0.0.0.0/0", "::0/0"}
 	} else {
@@ -47,20 +57,24 @@ func (c *WireGuardPeerConfig) Build() (proto.Message, error) {
 }
 
 type WireGuardConfig struct {
-	SecretKey  string                 `json:"secretKey"`
-	Address    []string               `json:"address"`
-	Peers      []*WireGuardPeerConfig `json:"peers"`
-	MTU        int                    `json:"mtu"`
-	NumWorkers int                    `json:"workers"`
+	IsClient bool `json:""`
+
+	NoKernelTun bool                   `json:"noKernelTun"`
+	SecretKey   string                 `json:"secretKey"`
+	Address     []string               `json:"address"`
+	Peers       []*WireGuardPeerConfig `json:"peers"`
+	MTU         int32                  `json:"mtu"`
+	Reserved    []byte                 `json:"reserved"`
+	DNS         []string               `json:"remoteDNS"`
 }
 
 func (c *WireGuardConfig) Build() (proto.Message, error) {
 	config := new(wireguard.DeviceConfig)
 
 	var err error
-	config.SecretKey, err = parseWireGuardKey(c.SecretKey)
+	config.SecretKey, err = ParseWireGuardKey(c.SecretKey)
 	if err != nil {
-		return nil, err
+		return nil, errors.New("invalid WireGuard secret key: %w", err)
 	}
 
 	if c.Address == nil {
@@ -70,42 +84,77 @@ func (c *WireGuardConfig) Build() (proto.Message, error) {
 		config.Endpoint = c.Address
 	}
 
-	if c.Peers != nil {
+	if c.IsClient {
 		config.Peers = make([]*wireguard.PeerConfig, len(c.Peers))
 		for i, p := range c.Peers {
 			msg, err := p.Build()
 			if err != nil {
 				return nil, err
 			}
-			config.Peers[i] = msg.(*wireguard.PeerConfig)
+			config.Peers[i] = msg
+		}
+	} else {
+		config.Users = make([]*protocol.User, len(c.Peers))
+		processUser := func(idx int) error {
+			p := c.Peers[idx]
+			m, err := p.Build()
+			if err != nil {
+				return err
+			}
+			config.Users[idx] = &protocol.User{
+				Email:   p.Email,
+				Level:   p.Level,
+				Account: serial.ToTypedMessage(m),
+			}
+			return nil
+		}
+		if err := task.ParallelForN(len(c.Peers), processUser); err != nil {
+			return nil, err
 		}
 	}
 
 	if c.MTU == 0 {
 		config.Mtu = 1420
 	} else {
-		config.Mtu = int32(c.MTU)
+		config.Mtu = c.MTU
 	}
-	// these a fallback code exists in github.com/nanoda0523/wireguard-go code,
-	// we don't need to process fallback manually
-	config.NumWorkers = int32(c.NumWorkers)
+
+	if len(c.Reserved) != 0 && len(c.Reserved) != 3 {
+		return nil, errors.New(`"reserved" should be empty or 3 bytes`)
+	}
+	config.Reserved = c.Reserved
+
+	config.IsClient = c.IsClient
+	config.NoKernelTun = c.NoKernelTun
+	config.DNS = c.DNS
 
 	return config, nil
 }
 
-func parseWireGuardKey(str string) (string, error) {
-	if len(str) != 64 {
-		// may in base64 form
-		dat, err := base64.StdEncoding.DecodeString(str)
-		if err != nil {
-			return "", err
-		}
-		if len(dat) != 32 {
-			return "", newError("key should be 32 bytes: " + str)
-		}
-		return hex.EncodeToString(dat), err
-	} else {
-		// already hex form
-		return str, nil
+func ParseWireGuardKey(str string) (string, error) {
+	var err error
+
+	if str == "" {
+		return "", errors.New("key must not be empty")
 	}
+
+	if len(str) == 64 {
+		_, err = hex.DecodeString(str)
+		if err == nil {
+			return str, nil
+		}
+	}
+
+	var dat []byte
+	str = strings.TrimSuffix(str, "=")
+	if strings.ContainsRune(str, '+') || strings.ContainsRune(str, '/') {
+		dat, err = base64.RawStdEncoding.DecodeString(str)
+	} else {
+		dat, err = base64.RawURLEncoding.DecodeString(str)
+	}
+	if err == nil {
+		return hex.EncodeToString(dat), nil
+	}
+
+	return "", errors.New("failed to deserialize key").Base(err)
 }

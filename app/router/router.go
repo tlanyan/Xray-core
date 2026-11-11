@@ -1,11 +1,14 @@
 package router
 
-//go:generate go run github.com/xtls/xray-core/common/errors/errorgen
-
 import (
 	"context"
+	"maps"
+	"sync"
+	"sync/atomic"
 
 	"github.com/xtls/xray-core/common"
+	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/serial"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/dns"
 	"github.com/xtls/xray-core/features/outbound"
@@ -16,9 +19,15 @@ import (
 // Router is an implementation of routing.Router.
 type Router struct {
 	domainStrategy Config_DomainStrategy
-	rules          []*Rule
-	balancers      map[string]*Balancer
+	rules          atomic.Pointer[[]*Rule]
+	script         *scriptEngine
+	balancers      atomic.Pointer[map[string]*Balancer]
 	dns            dns.Client
+
+	ctx        context.Context
+	ohm        outbound.Manager
+	dispatcher routing.Dispatcher
+	mu         sync.Mutex
 }
 
 // Route is an implementation of routing.Route.
@@ -26,49 +35,37 @@ type Route struct {
 	routing.Context
 	outboundGroupTags []string
 	outboundTag       string
+	ruleTag           string
 }
 
 // Init initializes the Router.
-func (r *Router) Init(ctx context.Context, config *Config, d dns.Client, ohm outbound.Manager) error {
+func (r *Router) Init(ctx context.Context, config *Config, d dns.Client, ohm outbound.Manager, dispatcher routing.Dispatcher) error {
 	r.domainStrategy = config.DomainStrategy
 	r.dns = d
+	r.ctx = ctx
+	r.ohm = ohm
+	r.dispatcher = dispatcher
 
-	r.balancers = make(map[string]*Balancer, len(config.BalancingRule))
-	for _, rule := range config.BalancingRule {
-		balancer, err := rule.Build(ohm)
+	if config.Script != "" {
+		script, err := newScriptEngine(config.Script)
 		if err != nil {
-			return err
+			return errors.New("failed to prepare routing script").Base(err)
 		}
-		balancer.InjectContext(ctx)
-		r.balancers[rule.Tag] = balancer
+		r.script = script
 	}
 
-	r.rules = make([]*Rule, 0, len(config.Rule))
-	for _, rule := range config.Rule {
-		cond, err := rule.BuildCondition()
-		if err != nil {
-			return err
-		}
-		rr := &Rule{
-			Condition: cond,
-			Tag:       rule.GetTag(),
-		}
-		btag := rule.GetBalancingTag()
-		if len(btag) > 0 {
-			brule, found := r.balancers[btag]
-			if !found {
-				return newError("balancer ", btag, " not found")
-			}
-			rr.Balancer = brule
-		}
-		r.rules = append(r.rules, rr)
-	}
-
-	return nil
+	r.rules.Store(new([]*Rule))
+	r.balancers.Store(&map[string]*Balancer{})
+	return r.ReloadRules(config, false)
 }
 
 // PickRoute implements routing.Router.
 func (r *Router) PickRoute(ctx routing.Context) (routing.Route, error) {
+	if r.script != nil {
+		return r.script.pickRoute(ctx)
+	}
+
+	originalCtx := ctx
 	rule, ctx, err := r.pickRouteInternal(ctx)
 	if err != nil {
 		return nil, err
@@ -77,7 +74,128 @@ func (r *Router) PickRoute(ctx routing.Context) (routing.Route, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Route{Context: ctx, outboundTag: tag}, nil
+	if rule.Webhook != nil {
+		rule.Webhook.Fire(originalCtx, tag)
+	}
+	return &Route{Context: ctx, outboundTag: tag, ruleTag: rule.RuleTag}, nil
+}
+
+// AddRule implements routing.Router.
+func (r *Router) AddRule(config *serial.TypedMessage, shouldAppend bool) error {
+	inst, err := config.GetInstance()
+	if err != nil {
+		return err
+	}
+	if c, ok := inst.(*Config); ok {
+		return r.ReloadRules(c, shouldAppend)
+	}
+	return errors.New("AddRule: config type error")
+}
+
+func (r *Router) ReloadRules(config *Config, shouldAppend bool) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	oldRules := *r.rules.Load()
+	oldBalancers := *r.balancers.Load()
+
+	var newRules []*Rule
+	newBalancers := make(map[string]*Balancer)
+	existTags := make(map[string]bool, len(oldRules)+len(config.Rule))
+	if shouldAppend {
+		newRules = append(newRules, oldRules...)
+		maps.Copy(newBalancers, oldBalancers)
+		for _, rule := range oldRules {
+			existTags[rule.RuleTag] = true
+		}
+	}
+
+	for _, rule := range config.BalancingRule {
+		if _, found := newBalancers[rule.Tag]; found {
+			return errors.New("duplicate balancer tag")
+		}
+		balancer, err := rule.Build(r.ohm, r.dispatcher)
+		if err != nil {
+			return err
+		}
+		balancer.InjectContext(r.ctx)
+		newBalancers[rule.Tag] = balancer
+	}
+
+	for _, rule := range config.Rule {
+		cond, err := rule.BuildCondition()
+		if err != nil {
+			return err
+		}
+		rr := &Rule{
+			Condition: cond,
+			Tag:       rule.GetTag(),
+			RuleTag:   rule.GetRuleTag(),
+		}
+		if rr.RuleTag != "" && existTags[rr.RuleTag] {
+			return errors.New("duplicate ruleTag ", rr.RuleTag)
+		}
+		existTags[rr.RuleTag] = true
+		if wh := rule.GetWebhook(); wh != nil {
+			notifier, err := NewWebhookNotifier(wh)
+			if err != nil {
+				return err
+			}
+			rr.Webhook = notifier
+		}
+		if btag := rule.GetBalancingTag(); len(btag) > 0 {
+			brule, found := newBalancers[btag]
+			if !found {
+				return errors.New("balancer ", btag, " not found")
+			}
+			rr.Balancer = brule
+		}
+		newRules = append(newRules, rr)
+	}
+
+	r.balancers.Store(&newBalancers)
+	r.rules.Store(&newRules)
+	if !shouldAppend {
+		closeWebhooks(oldRules)
+	}
+	return nil
+}
+
+// RemoveRule implements routing.Router.
+func (r *Router) RemoveRule(tag string) error {
+	if tag == "" {
+		return errors.New("empty tag name!")
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	oldRules := *r.rules.Load()
+	newRules := make([]*Rule, 0, len(oldRules))
+	var removed []*Rule
+	for _, rule := range oldRules {
+		if rule.RuleTag != tag {
+			newRules = append(newRules, rule)
+		} else {
+			removed = append(removed, rule)
+		}
+	}
+	r.rules.Store(&newRules)
+	closeWebhooks(removed)
+	return nil
+}
+
+// ListRule implements routing.Router
+func (r *Router) ListRule() []routing.Route {
+	rules := *r.rules.Load()
+	ruleList := make([]routing.Route, 0, len(rules))
+	for _, rule := range rules {
+		ruleList = append(ruleList, &Route{
+			outboundTag: rule.Tag,
+			ruleTag:     rule.RuleTag,
+		})
+	}
+	return ruleList
 }
 
 func (r *Router) pickRouteInternal(ctx routing.Context) (*Rule, routing.Context, error) {
@@ -90,7 +208,9 @@ func (r *Router) pickRouteInternal(ctx routing.Context) (*Rule, routing.Context,
 		ctx = routing_dns.ContextWithDNSClient(ctx, r.dns)
 	}
 
-	for _, rule := range r.rules {
+	rules := *r.rules.Load()
+
+	for _, rule := range rules {
 		if rule.Apply(ctx) {
 			return rule, ctx, nil
 		}
@@ -103,7 +223,7 @@ func (r *Router) pickRouteInternal(ctx routing.Context) (*Rule, routing.Context,
 	ctx = routing_dns.ContextWithDNSClient(ctx, r.dns)
 
 	// Try applying rules again if we have IPs.
-	for _, rule := range r.rules {
+	for _, rule := range rules {
 		if rule.Apply(ctx) {
 			return rule, ctx, nil
 		}
@@ -113,12 +233,32 @@ func (r *Router) pickRouteInternal(ctx routing.Context) (*Rule, routing.Context,
 }
 
 // Start implements common.Runnable.
-func (*Router) Start() error {
+func (r *Router) Start() error {
+	if r.script != nil {
+		if err := r.script.start(r); err != nil {
+			return errors.New("failed to initialize routing script").Base(err)
+		}
+	}
 	return nil
 }
 
+// closeWebhooks closes all webhook notifiers in the given rule set.
+func closeWebhooks(rules []*Rule) {
+	for _, rule := range rules {
+		if rule.Webhook != nil {
+			rule.Webhook.Close()
+		}
+	}
+}
+
 // Close implements common.Closable.
-func (*Router) Close() error {
+func (r *Router) Close() error {
+	if r.script != nil {
+		r.script.close()
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	closeWebhooks(*r.rules.Load())
 	return nil
 }
 
@@ -137,11 +277,15 @@ func (r *Route) GetOutboundTag() string {
 	return r.outboundTag
 }
 
+func (r *Route) GetRuleTag() string {
+	return r.ruleTag
+}
+
 func init() {
 	common.Must(common.RegisterConfig((*Config)(nil), func(ctx context.Context, config interface{}) (interface{}, error) {
 		r := new(Router)
-		if err := core.RequireFeatures(ctx, func(d dns.Client, ohm outbound.Manager) error {
-			return r.Init(ctx, config.(*Config), d, ohm)
+		if err := core.RequireFeatures(ctx, func(d dns.Client, ohm outbound.Manager, dispatcher routing.Dispatcher) error {
+			return r.Init(ctx, config.(*Config), d, ohm, dispatcher)
 		}); err != nil {
 			return nil, err
 		}
